@@ -5,6 +5,7 @@ const Bull = require('bull');
 const Redis = require('redis');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const path = require('path');
+require('dotenv').config(); // Top of the file
 const fs = require('fs').promises;
 
 const app = express();
