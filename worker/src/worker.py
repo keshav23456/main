@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import traceback
+import shutil
 from pathlib import Path
 
 class VideoGenerationWorker:
@@ -19,6 +20,14 @@ class VideoGenerationWorker:
         self.videos_dir = Path('/app/videos')
         self.videos_dir.mkdir(exist_ok=True)
         
+        # Test Redis connection
+        try:
+            self.redis_client.ping()
+            print("Redis connection successful")
+        except Exception as e:
+            print(f"Redis connection failed: {e}")
+            sys.exit(1)
+        
     def update_job_status(self, job_id, status, progress=None, error=None, video_path=None):
         """Update job status in Redis"""
         try:
@@ -28,7 +37,11 @@ class VideoGenerationWorker:
             if job_data:
                 data = json.loads(job_data)
             else:
-                data = {}
+                data = {
+                    'jobId': job_id,
+                    'status': 'unknown',
+                    'createdAt': time.time()
+                }
                 
             data['status'] = status
             data['updatedAt'] = time.time()
@@ -60,13 +73,23 @@ class VideoGenerationWorker:
             if 'class' in code and 'Scene' not in code:
                 code = code.replace('class GeneratedScene:', 'class GeneratedScene(Scene):')
                 
+            # Fix common naming issues
+            if 'GeneratedScene' not in code and 'class' in code:
+                # Try to find any class definition and rename it
+                lines = code.split('\n')
+                for i, line in enumerate(lines):
+                    if line.strip().startswith('class ') and '(Scene)' in line:
+                        class_name = line.split('class ')[1].split('(')[0].strip()
+                        code = code.replace(f'class {class_name}', 'class GeneratedScene')
+                        break
+                        
             # Add default scene if no class found
             if 'class GeneratedScene' not in code:
                 code += '''
 
 class GeneratedScene(Scene):
     def construct(self):
-        text = Text("Generated Animation")
+        text = Text("Generated Animation", font_size=36)
         text.set_color(BLUE)
         self.play(Write(text))
         self.wait(2)
@@ -85,7 +108,7 @@ from manim import *
 
 class GeneratedScene(Scene):
     def construct(self):
-        title = Text("Prompt-to-Video Generator", font_size=48)
+        title = Text("AI Video Generator", font_size=48)
         title.set_color(BLUE)
         
         subtitle = Text("Animation Generated Successfully!", font_size=24)
@@ -108,13 +131,20 @@ class GeneratedScene(Scene):
     def generate_video(self, job_data):
         """Generate video from Manim code"""
         job_id = job_data['job_id']
-        manim_code = job_data['data']['manimCode']
+        manim_code = job_data['data'].get('manimCode', '')
+        
+        print(f"Starting video generation for job {job_id}")
+        temp_file_path = None
         
         try:
             self.update_job_status(job_id, 'processing', 10)
             
             # Validate and fix the code
+            if not manim_code:
+                raise Exception("No Manim code provided")
+                
             fixed_code = self.validate_and_fix_code(manim_code)
+            print(f"Code validation completed for job {job_id}")
             
             self.update_job_status(job_id, 'processing', 25)
             
@@ -123,21 +153,27 @@ class GeneratedScene(Scene):
                 temp_file.write(fixed_code)
                 temp_file_path = temp_file.name
                 
+            print(f"Created temp file: {temp_file_path}")
             self.update_job_status(job_id, 'processing', 40)
             
             # Output video path
             output_path = self.videos_dir / f"{job_id}.mp4"
             
-            # Run Manim command
+            # Create temporary media directory for this job
+            temp_media_dir = f"/tmp/manim_media_{job_id}"
+            os.makedirs(temp_media_dir, exist_ok=True)
+            
+            # Run Manim command with better error handling
             cmd = [
                 'manim',
                 temp_file_path,
                 'GeneratedScene',
                 '--format=mp4',
-                '--media_dir=/tmp/manim_media',
-                f'--output_file={output_path}',
-                '--resolution=720,480',
-                '--frame_rate=30'
+                f'--media_dir={temp_media_dir}',
+                '--resolution=1280,720',
+                '--frame_rate=30',
+                '--disable_caching',
+                '-v', 'WARNING'  # Reduce verbose output
             ]
             
             print(f"Running command: {' '.join(cmd)}")
@@ -148,28 +184,46 @@ class GeneratedScene(Scene):
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300  # 5 minute timeout
+                timeout=300,  # 5 minute timeout
+                cwd='/app'
             )
             
+            print(f"Manim execution completed with return code: {result.returncode}")
+            if result.stdout:
+                print(f"Manim stdout: {result.stdout}")
+            if result.stderr:
+                print(f"Manim stderr: {result.stderr}")
+                
             self.update_job_status(job_id, 'processing', 80)
             
             if result.returncode == 0:
-                # Check if video file was created
-                if output_path.exists():
-                    self.update_job_status(
-                        job_id, 
-                        'completed', 
-                        100, 
-                        video_path=f"/videos/{job_id}.mp4"
-                    )
-                    print(f"Video generated successfully: {output_path}")
+                # Find the generated video file in the temp media directory
+                video_files = list(Path(temp_media_dir).rglob("*.mp4"))
+                
+                if video_files:
+                    # Copy the video to the final location
+                    source_video = video_files[0]
+                    shutil.copy2(source_video, output_path)
+                    
+                    print(f"Video copied to: {output_path}")
+                    
+                    if output_path.exists() and output_path.stat().st_size > 0:
+                        self.update_job_status(
+                            job_id, 
+                            'completed', 
+                            100, 
+                            video_path=f"/videos/{job_id}.mp4"
+                        )
+                        print(f"Video generated successfully: {output_path}")
+                    else:
+                        raise Exception("Video file is empty or corrupted")
                 else:
-                    raise Exception("Video file was not created")
+                    raise Exception("No video file found in output directory")
             else:
-                raise Exception(f"Manim failed: {result.stderr}")
+                raise Exception(f"Manim failed with return code {result.returncode}: {result.stderr}")
                 
         except subprocess.TimeoutExpired:
-            error_msg = "Video generation timed out"
+            error_msg = "Video generation timed out after 5 minutes"
             print(f"Job {job_id} timed out")
             self.update_job_status(job_id, 'failed', error=error_msg)
             
@@ -180,38 +234,51 @@ class GeneratedScene(Scene):
             self.update_job_status(job_id, 'failed', error=error_msg)
             
         finally:
-            # Cleanup temporary file
+            # Cleanup temporary files
             try:
-                if 'temp_file_path' in locals():
+                if temp_file_path and os.path.exists(temp_file_path):
                     os.unlink(temp_file_path)
-            except:
-                pass
+                    print(f"Cleaned up temp file: {temp_file_path}")
+                    
+                # Clean up temp media directory
+                temp_media_dir = f"/tmp/manim_media_{job_id}"
+                if os.path.exists(temp_media_dir):
+                    shutil.rmtree(temp_media_dir)
+                    print(f"Cleaned up temp media dir: {temp_media_dir}")
+            except Exception as cleanup_error:
+                print(f"Cleanup error: {cleanup_error}")
 
-    def process_jobs(self):
-        """Main job processing loop"""
-        print("Worker started, waiting for jobs...")
+    def listen_for_jobs(self):
+        """Listen for jobs using Bull queue format"""
+        queue_key = "bull:video generation:waiting"
         
         while True:
             try:
-                # Check for jobs in the Bull queue (using Redis lists)
-                job_data = self.redis_client.blpop('bull:video generation:waiting', timeout=5)
+                # Use BLPOP to wait for jobs
+                result = self.redis_client.blpop(queue_key, timeout=5)
                 
-                if job_data:
-                    job_json = job_data[1]
-                    job_info = json.loads(job_json)
+                if result:
+                    queue_name, job_data = result
+                    print(f"Received job from queue: {queue_name}")
                     
-                    print(f"Processing job: {job_info}")
-                    
-                    # Extract job ID and data
-                    job_id = job_info.get('id')
-                    if job_id:
-                        enhanced_job = {
-                            'job_id': job_id,
-                            'data': job_info.get('data', {})
-                        }
-                        self.generate_video(enhanced_job)
-                    else:
-                        print("Job missing ID, skipping")
+                    try:
+                        job_info = json.loads(job_data)
+                        job_id = job_info.get('id')
+                        
+                        if job_id:
+                            print(f"Processing job {job_id}")
+                            enhanced_job = {
+                                'job_id': str(job_id),
+                                'data': job_info.get('data', {})
+                            }
+                            self.generate_video(enhanced_job)
+                        else:
+                            print("Job missing ID, skipping")
+                            
+                    except json.JSONDecodeError as e:
+                        print(f"Invalid JSON in job data: {e}")
+                    except Exception as e:
+                        print(f"Error processing job: {e}")
                         
             except redis.exceptions.TimeoutError:
                 # Normal timeout, continue loop
@@ -220,10 +287,27 @@ class GeneratedScene(Scene):
                 print("Worker stopped by user")
                 break
             except Exception as e:
-                print(f"Error in job processing loop: {e}")
+                print(f"Error in job listening loop: {e}")
                 print(f"Traceback: {traceback.format_exc()}")
                 time.sleep(5)  # Wait before retrying
 
+    def process_jobs(self):
+        """Main job processing method with fallback queue checking"""
+        print("Worker started, waiting for jobs...")
+        print(f"Redis connected to: {os.getenv('REDIS_HOST', 'redis')}:{os.getenv('REDIS_PORT', 6379)}")
+        
+        # Check if we can connect to Redis
+        try:
+            self.redis_client.ping()
+            print("Redis connection verified")
+        except Exception as e:
+            print(f"Redis connection failed: {e}")
+            return
+        
+        # Start listening for jobs
+        self.listen_for_jobs()
+
 if __name__ == "__main__":
+    print("Starting Video Generation Worker...")
     worker = VideoGenerationWorker()
     worker.process_jobs()
